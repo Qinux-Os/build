@@ -1,0 +1,78 @@
+name: Validate modules
+
+# Runs qinux-build over every module in the organization. This is the check
+# that catches a broken JSON file, a config that no longer matches its schema,
+# a kernel config missing a required symbol, or a dependency cycle, before
+# anyone tries to build an ISO.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly, so breakage in a module nobody is touching is still noticed.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate all modules
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build
+
+      # Modules are separate repositories, so the validator needs all of them.
+      # Shallow clones, in parallel: 51 sequential clones is slow.
+      - name: Check out every module
+        run: |
+          mkdir -p src
+          awk -F'|' '
+            NF >= 4 && $1 !~ /^#/ && $1 !~ /^[[:space:]]*$/ && $1 !~ /^-+/ {
+              repo = $4; gsub(/[[:space:]]/, "", repo)
+              print repo
+            }
+          ' build/config/modules.conf > modules.txt
+
+          echo "cloning $(wc -l < modules.txt) repositories"
+          xargs -P 8 -I{} sh -c '
+            name="${1#Qinux-Os/}"
+            git clone --depth 1 -q "https://github.com/${1}.git" "src/${name}" \
+              || echo "::warning::could not clone ${1}, it will be skipped"
+          ' _ {} < modules.txt
+
+      - name: Show the build order
+        run: ./build/scripts/qinux-build --list
+
+      # --unstable so every failure is reported in one run. The step still
+      # fails on a non-zero exit, so this check fails if any module is broken.
+      - name: Validate every module
+        run: |
+          ./build/scripts/qinux-build \
+            --unstable \
+            --root "$PWD/src" \
+            --output "$PWD/out"
+
+      - name: Report
+        if: always()
+        run: |
+          echo "Modules that built:"
+          ls out/.stamps 2>/dev/null || echo "none"
+
+      - name: Upload stamps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-stamps
+          path: out/.stamps/
+          retention-days: 7

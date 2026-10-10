@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+#
+# qinux-build - build the Qinux distribution from its repositories.
+#
+# Builds everything, a chosen set of modules, or a single module together with
+# its dependencies. Supports an unstable mode for work in progress.
+#
+# Usage:
+#   qinux-build [options]                 build every module
+#   qinux-build [options] MODULE...       build the named modules
+#
+# Options:
+#   -u, --unstable        Unstable build. Relaxed checks, no caching, keeps
+#                         going past a failing module.
+#   -s, --stable          The default. Strict checks, stops at the first
+#                         failure. This is what a release uses.
+#   -f, --force           Rebuild even if the module is up to date.
+#   -n, --dry-run         Print what would be done, do not do it.
+#   -l, --list            List modules and exit.
+#   -t, --tree MODULE     Show the dependency tree for MODULE.
+#   -c, --config PATH     Module config. Default: config/modules.conf
+#   -r, --root DIR        Source directory holding the repositories.
+#                         Default: $QINUX_SOURCE_ROOT, then ..
+#   -o, --output DIR      Build output. Default: .build
+#   -h, --help            This help.
+#
+# Exit status:
+#   0  every selected module built
+#   1  a module failed
+#   2  bad usage or a broken module config
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Resolve paths relative to this script, so the tool works from any cwd.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+# --------------------------------------------------------------------------
+# Defaults
+# --------------------------------------------------------------------------
+
+UNSTABLE=0
+DRY_RUN=0
+FORCE=0
+CONFIG="$REPO_ROOT/config/modules.conf"
+SOURCE_ROOT="${QINUX_SOURCE_ROOT:-}"
+OUTPUT_DIR="$REPO_ROOT/.build"
+ACTION='build'
+TREE_TARGET=''
+
+declare -a REQUESTED=()
+
+usage() {
+    sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# --------------------------------------------------------------------------
+# Arguments
+# --------------------------------------------------------------------------
+
+parse_args() {
+    while (( $# > 0 )); do
+        case $1 in
+            -u|--unstable) UNSTABLE=1 ;;
+            -s|--stable)   UNSTABLE=0 ;;
+            -n|--dry-run)  DRY_RUN=1 ;;
+            -f|--force)    FORCE=1 ;;
+            -c|--config)   shift || die "--config needs a path"; CONFIG=$1 ;;
+            -r|--root)     shift || die "--root needs a path"; SOURCE_ROOT=$1 ;;
+            -o|--output)   shift || die "--output needs a path"; OUTPUT_DIR=$1 ;;
+            -t|--tree)     ACTION='tree'; shift || die "--tree needs a module"; TREE_TARGET=$1 ;;
+            -l|--list)     ACTION='list' ;;
+            -h|--help)     usage ;;
+            --)            shift; REQUESTED+=("$@"); break ;;
+            -*)            die "unknown option: $1 (try --help)" ;;
+            *)             REQUESTED+=("$1") ;;
+        esac
+        shift || true
+    done
+
+    if (( ${#REQUESTED[@]} == 0 )); then
+        REQUESTED=("${MODULE_NAMES[@]}")
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Source tree
+#
+# A module is a directory named after it, either in SOURCE_ROOT or, when that
+# is unset, as a sibling of this repository. Both layouts are common: a
+# developer with a flat checkout, and CI with one directory per module.
+# --------------------------------------------------------------------------
+
+resolve_source_root() {
+    [[ -n "$SOURCE_ROOT" ]] && return 0
+    local parent
+    parent=$(dirname -- "$REPO_ROOT")
+    if [[ -d "$parent/$1" ]]; then
+        SOURCE_ROOT=$parent
+        return 0
+    fi
+    if [[ -d "$REPO_ROOT/$1" ]]; then
+        SOURCE_ROOT=$REPO_ROOT
+        return 0
+    fi
+    return 1
+}
+
+module_path() {
+    printf '%s/%s' "$SOURCE_ROOT" "$1"
+}
+
+# --------------------------------------------------------------------------
+# Listing and trees
+# --------------------------------------------------------------------------
+
+do_list() {
+    printf '%-18s %-8s %s\n' MODULE KIND DEPENDS-ON
+    printf '%-18s %-8s %s\n' '------------------' '--------' '-----------'
+    local n
+    for n in "${MODULE_NAMES[@]}"; do
+        printf '%-18s %-8s %s\n' \
+            "$n" "${MODULE_KIND[$n]}" "${MODULE_DEPS[$n]:-}"
+    done
+}
+
+# print_tree NAME PREFIX LAST DEPTH
+#
+# Draws one node and its dependencies. PREFIX is what to print before a
+# continuation line, LAST says whether this node is the final child.
+print_tree() {
+    local name=$1 prefix=$2 last=$3 depth=$4
+    local deps=${MODULE_DEPS[$name]:-}
+    local -a list=()
+    local dep
+
+    if (( depth == 0 )); then
+        printf '%s\n' "$name"
+    else
+        if (( last )); then
+            printf '%s`- %s\n' "$prefix" "$name"
+        else
+            printf '%s|- %s\n' "$prefix" "$name"
+        fi
+    fi
+
+    # Depth 2 would duplicate every shared ancestor. One level shows what a
+    # module needs; the full order comes from the build-order line.
+    (( depth >= 2 )) && return 0
+
+    read -r -a list <<<"$deps"
+    local i
+    for i in "${!list[@]}"; do
+        dep=${list[$i]}
+        local child_prefix
+        if (( last == 0 )); then
+            child_prefix="${prefix}|  "
+        else
+            child_prefix="${prefix}   "
+        fi
+        print_tree "$dep" "$child_prefix" $(( i == ${#list[@]} - 1 )) $(( depth + 1 ))
+    done
+}
+
+do_tree() {
+    module_exists "$TREE_TARGET" || die "unknown module: $TREE_TARGET"
+    printf 'dependency tree for %s\n\n' "$TREE_TARGET"
+    print_tree "$TREE_TARGET" '' 1 0
+    printf '\nbuild order:\n'
+    resolve_order "$TREE_TARGET" | sed 's/^/  /'
+}
+
+# --------------------------------------------------------------------------
+# Building
+# --------------------------------------------------------------------------
+
+declare -i N_OK=0 N_FAIL=0 N_SKIP=0
+
+# stamp_path MODULE   Path of the stamp file recording the last good build.
+stamp_path() {
+    printf '%s/.stamps/%s.stamp' "$OUTPUT_DIR" "$1"
+}
+
+# is_current MODULE
+#
+# True when the module's stamp is newer than every source file in it. Cheap,
+# and correct enough for a build that is mostly validation.
+is_current() {
+    (( FORCE == 1 )) && return 1
+    local stamp; stamp=$(stamp_path "$1")
+    [[ -f "$stamp" ]] || return 1
+    local src; src=$(module_path "$1")
+    [[ -d "$src" ]] || return 1
+    local newer
+    newer=$(find "$src" -type f -newer "$stamp" -not -path '*/.git/*' -print -quit 2>/dev/null)
+    [[ -z "$newer" ]]
+}
+
+mark_built() {
+    local stamp; stamp=$(stamp_path "$1")
+    mkdir -p "$(dirname "$stamp")" || return 0
+    : >"$stamp"
+}
+
+# build_data MODULE
+#
+# The workhorse. Every module kind ends up here to validate whatever it holds,
+# because validation is the only build a configuration repository really has.
+build_data() {
+    local name=$1 src; src=$(module_path "$name")
+    local -a json=()
+    local f
+
+    while IFS= read -r f; do
+        json+=("$f")
+    done < <(find "$src" -name '*.json' -not -path '*/.git/*' 2>/dev/null)
+
+    if (( ${#json[@]} > 0 )); then
+        have python3 || die "python3 is required to validate JSON in $name"
+        local bad=0
+        for f in "${json[@]}"; do
+            # The validator prints its own message; python's traceback is noise.
+            if ! python3 -c \
+                'import json,sys
+try:
+    json.load(open(sys.argv[1]))
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)' "$f" 2>&1; then
+                log_err "$name: invalid JSON: ${f#"$src"/}"
+                bad=1
+            fi
+        done
+        (( bad == 1 )) && return 1
+        log_step "$name: ${#json[@]} JSON file(s) valid"
+    fi
+
+    # Shell scripts, if the module has any.
+    local -a scripts=()
+    while IFS= read -r f; do
+        scripts+=("$f")
+    done < <(find "$src" \( -name '*.sh' -o -path '*/scripts/*' -type f \) \
+                 -not -path '*/.git/*' 2>/dev/null)
+
+    if (( ${#scripts[@]} > 0 )) && have shellcheck; then
+        local bad=0
+        for f in "${scripts[@]}"; do
+            shellcheck -S warning "$f" || bad=1
+        done
+        (( bad == 1 )) && return 1
+        log_step "$name: shellcheck clean"
+    fi
+}
+
+build_shell() {
+    local name=$1
+    build_data "$name" || return 1
+    have shellcheck || log_warn "$name: shellcheck not installed, skipped"
+    return 0
+}
+
+build_python() {
+    local name=$1 src; src=$(module_path "$name")
+    build_data "$name" || return 1
+    if have ruff; then
+        ruff format --check "$src" || return 1
+        ruff check "$src" || return 1
+        log_step "$name: ruff clean"
+    else
+        log_warn "$name: ruff not installed, skipped"
+    fi
+}
+
+build_qml() {
+    local name=$1 src; src=$(module_path "$name")
+    build_data "$name" || return 1
+    if have qmllint; then
+        find "$src" -name '*.qml' -not -path '*/.git/*' -print0 \
+            | xargs -0 -r qmllint -I "$src"
+        log_step "$name: qmllint clean"
+    else
+        log_warn "$name: qmllint not installed, skipped"
+    fi
+}
+
+build_kernel() {
+    local name=$1 src; src=$(module_path "$name")
+    build_data "$name" || return 1
+    # A kernel config that is missing a symbol produces a package that installs
+    # and then cannot boot, which is not something CI should discover on a user's
+    # machine.
+    if [[ -x "$src/scripts/verify-config" && -r "$src/config" ]]; then
+        "$src/scripts/verify-config" "$src/config" || return 1
+    else
+        log_warn "$name: no scripts/verify-config or config to check"
+    fi
+}
+
+build_iso() {
+    local name=$1 src; src=$(module_path "$name")
+    build_data "$name" || return 1
+    have xorriso || log_warn "$name: xorriso not installed, cannot assemble an image"
+    return 0
+}
+
+build_module() {
+    local name=$1
+    local kind=${MODULE_KIND[$name]}
+
+    if is_current "$name"; then
+        log_step "$name: up to date"
+        N_SKIP=$(( N_SKIP + 1 ))
+        return 0
+    fi
+
+    log "building $name ($kind)"
+
+    if (( DRY_RUN == 1 )); then
+        log_step "$name: dry run, not building"
+        return 0
+    fi
+
+    require_tools "$kind"
+
+    local start; start=$(now)
+    local rc=0
+    case $kind in
+        data)   build_data   "$name" || rc=$? ;;
+        shell)  build_shell  "$name" || rc=$? ;;
+        python) build_python "$name" || rc=$? ;;
+        qml)    build_qml    "$name" || rc=$? ;;
+        kernel) build_kernel "$name" || rc=$? ;;
+        iso)    build_iso    "$name" || rc=$? ;;
+        *)      die "unknown kind for module $name: $kind" ;;
+    esac
+    local elapsed; elapsed=$(( $(now) - start ))
+
+    if (( rc == 0 )); then
+        mark_built "$name"
+        log_ok "$name built in $(format_duration "$elapsed")"
+        N_OK=$(( N_OK + 1 ))
+    else
+        log_err "$name FAILED"
+        N_FAIL=$(( N_FAIL + 1 ))
+        # Stable stops at the first failure. Unstable records it and carries on,
+        # because the whole point of --unstable is to see every failure at once.
+        (( UNSTABLE == 1 )) || return 1
+        log_warn "$name failed, continuing because --unstable"
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+main() {
+    # The config is loaded before parsing so that --list and the default
+    # target list know the module names.
+    load_modules "$CONFIG" || exit 2
+    parse_args "$@"
+
+    if (( UNSTABLE == 1 )); then
+        log_warn "unstable build: relaxed checks, failures do not stop the run"
+    fi
+
+    case $ACTION in
+        list) do_list; exit 0 ;;
+        tree) do_tree;   exit 0 ;;
+    esac
+
+    if ! resolve_source_root "${MODULE_NAMES[0]}"; then
+        die "cannot find the source tree; pass --root DIR or set QINUX_SOURCE_ROOT"
+    fi
+    [[ -d "$SOURCE_ROOT" ]] || die "source root not a directory: $SOURCE_ROOT"
+    log_step "source root: $SOURCE_ROOT"
+    log_step "output:      $OUTPUT_DIR"
+
+    local -a order=()
+    mapfile -t order < <(resolve_order "${REQUESTED[@]}")
+
+    if (( ${#order[@]} == 0 )); then
+        die "nothing to build"
+    fi
+
+    (( DRY_RUN == 0 )) && mkdir -p "$OUTPUT_DIR/.stamps"
+
+    local n started; started=$(now)
+    for n in "${order[@]}"; do
+        if [[ ! -d "$(module_path "$n")" ]]; then
+            log_warn "$n: source not present, skipping"
+            N_SKIP=$(( N_SKIP + 1 ))
+            continue
+        fi
+        # build_module returns non-zero only in stable mode. In unstable mode
+        # it has already counted the failure and returns 0, so the loop goes on.
+        build_module "$n" || break
+    done
+
+    local elapsed; elapsed=$(( $(now) - started ))
+
+    printf '\n'
+    log "built ${N_OK}, skipped ${N_SKIP}, failed ${N_FAIL} in $(format_duration "$elapsed")"
+
+    if (( N_FAIL > 0 )); then
+        return 1
+    fi
+    return 0
+}
+
+main "$@"
